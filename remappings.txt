@@ -1,0 +1,11 @@
+﻿lib/p256-verifier/lib/openzeppelin-contracts/lib/forge-std/:ds-test/=lib/p256-verifier/lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/
+lib/p256-verifier/lib/forge-std/:ds-test/=lib/p256-verifier/lib/forge-std/lib/ds-test/src/
+lib/p256-verifier/lib/openzeppelin-contracts/:forge-std/=lib/p256-verifier/lib/openzeppelin-contracts/lib/forge-std/src/
+lib/p256-verifier/:forge-std/=lib/p256-verifier/lib/forge-std/src/
+@openzeppelin/contracts/=lib/p256-verifier/lib/openzeppelin-contracts/contracts/
+account-abstraction/=lib/account-abstraction/contracts/
+ds-test/=lib/p256-verifier/lib/forge-std/lib/ds-test/src/
+erc4626-tests/=lib/p256-verifier/lib/openzeppelin-contracts/lib/erc4626-tests/
+forge-std/=lib/forge-std/src/
+openzeppelin-contracts/=lib/p256-verifier/lib/openzeppelin-contracts/
+p256-verifier/=lib/p256-verifier/
