@@ -1,7 +1,7 @@
 # Passkey-Based Smart Wallet (ERC-4337)
 
 ## Project Overview
-A college PBL project building a smart contract wallet that uses Passkeys (WebAuthn/P-256) for everyday transaction signing, eliminating the need for seed phrases. It leverages ERC-4337 Account Abstraction for gasless transactions and MetaMask for account recovery.
+A college PBL project building a smart contract wallet that uses Passkeys (WebAuthn/P-256) for everyday transaction signing, eliminating the need for seed phrases. It leverages ERC-4337 Account Abstraction for gasless transactions and MetaMask strictly for account recovery.
 
 ## Tech Stack
 - **Frontend:** React, Vite, TypeScript, viem, permissionless.js
@@ -10,20 +10,16 @@ A college PBL project building a smart contract wallet that uses Passkeys (WebAu
 - **Infrastructure:** Alchemy (RPC), Pimlico (Bundler/Paymaster)
 
 ## Approved Architecture
-- **Framework:** Existing ERC-4337 Smart Account framework (Coinbase Smart Wallet).
-- **Authentication:** Passkeys (P-256/WebAuthn) for daily transactions.
-- **Recovery:** MetaMask acts strictly as a recovery guardian. (Note: Enforced at the frontend level for this project scope).
-- **ERC-4337 Version:** v0.7.
+- **Framework:** Existing ERC-4337 Smart Account framework (v0.7).
+- **Authentication:** Passkeys (P-256/WebAuthn) for daily transaction signing.
+- **Recovery:** MetaMask acts strictly as a recovery guardian. (Enforced at the frontend level for this project scope).
+- **Cryptography:** `p256-verifier` library utilizing RIP-7212 precompiles on Base Sepolia for efficient signature validation.
 
 ## Current Progress
-- [x] Development environment setup (Foundry, React/Vite).
-- [x] Frontend Vite server and HMR verified.
-- [x] Smart contract deployment pipeline verified.
-- [x] Successfully deployed test contract to Base Sepolia.
-  - **Contract Address:** `0xa79997c2aEE3D0309F3769e7eb290F39578b4268`
-  - **Tx Hash:** `0xec3500a749258bd5b4f32a0039c39e3f84edc8bdc5921531a6545445feb6eef8`
+- [x] **Milestone 1:** Development environment setup (Foundry, React/Vite) and verified Base Sepolia deployment pipeline.
+- [x] **Milestone 2:** Installed core ERC-4337 v0.7 (`account-abstraction`) and P-256 (`p256-verifier`) libraries. Configured Foundry `viaIR` optimizer and remappings.
 
-## Next Steps (Milestone 2)
-- Clean up test boilerplate.
-- Install core ERC-4337 and P-256/WebAuthn verification libraries.
-- Begin Smart Account implementation.
+## Next Steps (Milestone 3)
+- [ ] Implement the core Passkey Smart Account contract (`validateUserOp` with P-256 signature verification).
+- [ ] Write deployment scripts for the new Smart Account.
+- [ ] Integrate WebAuthn/Passkey creation and signing on the frontend.
