@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@simplewebauthn/browser": "^14.0.0",
     "ox": "^1.8.13",
     "permissionless": "^0.5.2",
     "react": "^19.3.1",
