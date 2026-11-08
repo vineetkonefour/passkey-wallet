@@ -1,42 +1,79 @@
-# Passkey-Based Smart Wallet (ERC-4337)
+# 🔑 Passkey Wallet (ERC-4337 Smart Account)
 
-## Project Overview
-A college PBL project building a smart contract wallet that uses **Passkeys (WebAuthn/P-256)** for everyday transaction signing, eliminating the need for seed phrases. It leverages **ERC-4337 Account Abstraction** for gasless transactions and MetaMask strictly for account recovery.
+A fully functional, gasless Smart Contract Wallet leveraging **WebAuthn (Passkeys)** for secure, hardware-bound authentication and **ERC-4337 Account Abstraction** for a seamless, seedless user experience.
 
-## Tech Stack
-- **Frontend:** React, Vite, TypeScript, viem, permissionless.js, @simplewebauthn/browser
-- **Smart Contracts:** Solidity, Foundry
-- **Network:** Base Sepolia (Testnet)
-- **Infrastructure:** Alchemy (RPC), Pimlico (Bundler/Paymaster)
-- **Cryptography:** RIP-7212 Precompile (native P-256 verification on Base)
+## 🌟 Key Features
 
-## Architecture
-- **Framework:** Custom ERC-4337 v0.7 Smart Account.
-- **Authentication:** Passkeys (P-256/WebAuthn) for daily transaction signing.
-- **Recovery:** MetaMask acts strictly as a recovery guardian (frontend-enforced for project scope).
-- **Signature Verification:** Uses the native **RIP-7212 precompile** at `0x0000000000000000000000000000000000000100` on Base Sepolia for gas-efficient P-256 signature validation.
+- **🔐 True WebAuthn Integration:** Extracts real, hardware-bound P-256 elliptic curve public keys (X and Y coordinates) directly from device secure enclaves (Windows Hello, Apple FaceID/TouchID).
+- **📱 Multi-Device Support:** The smart contract maintains a mapping of authorized devices, allowing users to access their wallet from multiple trusted devices simultaneously.
+- **🛡️ Guardian Recovery:** A designated MetaMask address acts as an admin "Guardian." It cannot spend funds, but it can add or remove devices in case a phone is lost or stolen.
+- **⛽ Gasless Transactions:** Integrated with **Pimlico** (ERC-4337 v0.7) to sponsor gas fees, allowing users to interact with the wallet without ever needing to hold ETH.
 
-## How It Works
-1. **Key Generation:** The user's phone generates a P-256 keypair via WebAuthn. The **public key** (`ownerX`, `ownerY`) is stored on-chain in the smart contract. The **private key** never leaves the device.
-2. **Transaction Signing:** When the user initiates a transaction, the phone signs it with the private key, producing a digital signature (`r`, `s`).
-3. **Validation:** The smart contract's `validateUserOp` function uses the RIP-7212 precompile to verify that the signature mathematically matches the stored public key.
-4. **Execution:** If valid, the `execute` function forwards the transaction to the target address.
+## 🏗️ Architecture: How It Works
 
-## Current Progress
-- [x] **Milestone 1:** Development environment setup (Foundry, React/Vite) and verified Base Sepolia deployment pipeline.
-- [x] **Milestone 2:** Installed core ERC-4337 v0.7 (`account-abstraction`) and P-256 (`p256-verifier`) libraries. Configured Foundry `viaIR` optimizer and remappings.
-- [x] **Milestone 3:** Implemented `PasskeyWallet.sol` with:
-  - RIP-7212 precompile integration for native P-256 signature verification
-  - `validateUserOp` function for ERC-4337 EntryPoint validation
-  - `execute` function for forwarding transactions to target addresses
+This project separates concerns into three distinct entities to maximize security and user experience:
 
-## Next Steps (Milestone 4)
-- [ ] Integrate `@simplewebauthn/browser` in the React frontend.
-- [ ] Build "Create Passkey Wallet" flow that generates the P-256 keypair via WebAuthn.
-- [ ] Deploy the `PasskeyWallet` contract from the frontend using the generated public key.
-- [ ] Implement transaction signing flow using the phone's biometric authentication.
+1. **The Vault (Smart Contract):** Lives on the blockchain. It holds the funds and the list of authorized Public Keys (X, Y coordinates). It has *no* private key of its own.
+2. **The Passkeys (Devices):** The user's phone or PC. The secure hardware chip generates a P-256 keypair. The Private Key *never leaves the device*. The device uses it to sign transactions, which the Vault verifies against its stored Public Key list.
+3. **The Guardian (MetaMask):** The emergency recovery key. It is completely bypassed during daily transactions. It only wakes up to authorize changes to the device list (e.g., removing a lost phone).
 
-## Security Model
-- The smart contract is a **personal vault**, not a public application.
-- Only the holder of the matching private key (stored securely on the user's device) can authorize transactions.
-- The blockchain network (Base Sepolia) is public, but the contract's validation logic ensures only the owner can move funds.
+## 🛠️ Tech Stack
+
+- **Smart Contracts:** Solidity ^0.8.28, Foundry (Forge, Cast)
+- **Frontend:** React, Vite, TypeScript
+- **Web3 Libraries:** `viem`, `permissionless` (v0.5.x, ERC-4337 v0.7)
+- **Cryptography:** `cbor-web` (for parsing WebAuthn attestation objects), Native Web Crypto API
+- **Infrastructure:** Pimlico (Bundler & Paymaster), Base Sepolia Testnet
+
+## 🚀 Live Deployment & Proof
+
+This project is deployed and verified on the **Base Sepolia** testnet.
+
+- **Passkey Wallet Contract:** [0x1a9Da4dc88a2D3DBDF39f4877cAD4C623B23F1C2](https://sepolia.basescan.org/address/0x1a9Da4dc88a2D3DBDF39f4877cAD4C623B23F1C2)
+- **Test Smart Account Address:** `0x3070CFf12E0f1C1790130a3cF17436321EB4aB8a`
+- **Successful Gasless Transaction:** [0x2894a6b387bb4d56d7e4491e1da2bd68de8ebde952a2c3d5bee9c03344ac8f89](https://sepolia.basescan.org/tx/0x2894a6b387bb4d56d7e4491e1da2bd68de8ebde952a2c3d5bee9c03344ac8f89)  
+  *(Note: Check the transaction details on BaseScan to see that the Paymaster sponsored the gas fee, and the sender paid 0 ETH).*
+
+## 💡 Challenges Overcome & Lessons Learned
+
+Building this required solving several non-trivial Web3 and WebAuthn edge cases:
+
+1. **WebAuthn Localhost Timeouts:** Browsers strictly enforce secure contexts for WebAuthn. Forcing `platform` authenticators on `http://localhost` often resulted in `NotAllowedError` timeouts. This was solved by utilizing Chrome's DevTools Virtual Authenticator and `cross-platform` QR-code flows to reliably extract the raw P-256 coordinates.
+2. **Binary Parsing in the Browser:** Extracting the X and Y coordinates from the WebAuthn `attestationObject` requires parsing CBOR-encoded binary data. Standard Node.js `Buffer` is unavailable in Vite. This was solved by writing custom `base64url` to `Uint8Array` conversion utilities and manually traversing the `authData` byte offsets.
+3. **Permissionless API Shifts:** The `permissionless` library underwent significant API changes between versions. The deprecated `middleware` syntax silently failed, causing `undefined` gas fee errors. This was resolved by adopting the modern v0.5.x syntax, explicitly defining `entryPoint07Address`, and using the `userOperation.estimateFeesPerGas` configuration.
+
+## 📦 How to Run Locally
+
+**1. Clone the repository:**
+
+```bash
+git clone <your-repo-url>
+cd passkey-wallet
+```
+
+**2. Install dependencies:**
+
+```bash
+# Install Foundry dependencies
+forge install
+
+# Install frontend dependencies
+cd frontend
+npm install --legacy-peer-deps
+```
+
+**3. Set up Environment Variables:**
+
+Create a `.env` file in the `frontend` directory:
+
+```env
+VITE_PIMLICO_API_KEY=your_pimlico_api_key_here
+```
+
+**4. Run the development server:**
+
+```bash
+npm run dev
+```
+
+**5.** Open `http://localhost:5173` in your browser to test the Passkey generation and Paymaster integration.
