@@ -137,4 +137,3 @@ forge build
 
 # Deploy to Base Sepolia
 forge script script/DeployPasskeyWallet.s.sol:DeployPasskeyWallet --rpc-url $BASE_SEPOLIA_RPC_URL --private-key $PRIVATE_KEY --broadcast --legacy
->>>>>>> ef63f0d901ecc2f44726d2054ceb957877d68d25

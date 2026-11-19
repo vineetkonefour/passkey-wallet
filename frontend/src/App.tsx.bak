@@ -1,0 +1,666 @@
+import { useState, useEffect } from 'react';
+import { 
+  createPublicClient, http, parseEther, formatEther, encodeAbiParameters, 
+  encodeFunctionData, bytesToHex, hexToBytes, type Address, type Hex
+} from 'viem';
+import { baseSepolia } from 'viem/chains';
+import { 
+  toSmartAccount, getUserOperationHash, 
+  entryPoint07Abi, entryPoint07Address 
+} from 'viem/account-abstraction';
+import { createSmartAccountClient } from 'permissionless';
+import { createPimlicoClient } from 'permissionless/clients/pimlico';
+import { pointFromSpki, parseASN1Signature, b64uToBytes } from './passkeyUtils';
+
+// --- Constants ---
+const FACTORY_ADDRESS = "0xa0508683199a7206c5f47857F5056C12DE938C99" as Address; // Update if you redeployed
+const GUARDIAN_ADDRESS = "0x69D0B674C889Cb9977eDf5771aAC538B6c3D26b1" as Address;
+
+const apiKey = import.meta.env.VITE_PIMLICO_API_KEY as string;
+const pimlicoUrl = `https://api.pimlico.io/v2/${baseSepolia.id}/rpc?apikey=${apiKey}`;
+
+const publicClient = createPublicClient({ chain: baseSepolia, transport: http() });
+const pimlicoClient = createPimlicoClient({ 
+  chain: baseSepolia, 
+  transport: http(pimlicoUrl), 
+  entryPoint: { address: entryPoint07Address, version: '0.7' } 
+});
+
+// --- ABIs ---
+const executeAbi = [{ 
+  name: 'execute', type: 'function', 
+  inputs: [{name:'target',type:'address'},{name:'value',type:'uint256'},{name:'data',type:'bytes'}], 
+  outputs: [], stateMutability: 'payable' 
+}] as const;
+
+const factoryAbi = [{
+  name: 'getAddress', type: 'function',
+  inputs: [{name: 'ownerXs', type: 'uint256[]'}, {name: 'ownerYs', type: 'uint256[]'}, {name: 'guardian', type: 'address'}, {name: 'salt', type: 'uint256'}],
+  outputs: [{name: '', type: 'address'}], stateMutability: 'view'
+}, {
+  name: 'createAccount', type: 'function',
+  inputs: [{name: 'ownerXs', type: 'uint256[]'}, {name: 'ownerYs', type: 'uint256[]'}, {name: 'guardian', type: 'address'}, {name: 'salt', type: 'uint256'}],
+  outputs: [{name: '', type: 'address'}], stateMutability: 'nonpayable'
+}] as const;
+
+const recoveryAbi = [{
+  name: 'addPasskey', type: 'function',
+  inputs: [{name: '_ownerX', type: 'uint256'}, {name: '_ownerY', type: 'uint256'}],
+  outputs: [], stateMutability: 'nonpayable'
+}] as const;
+
+const sigAbi = [
+  { type: 'bytes' }, { type: 'string' }, { type: 'uint256' },
+  { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' },
+] as const;
+
+const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+
+function encodePasskeySignature(
+  authData: Hex, clientDataJSON: string, r: bigint, s: bigint, ownerX: bigint
+): Hex {
+  return encodeAbiParameters(sigAbi, [
+    authData, clientDataJSON,
+    BigInt(clientDataJSON.indexOf('"challenge":')),
+    BigInt(clientDataJSON.indexOf('"type":')),
+    r, s, ownerX,
+  ]);
+}
+
+async function toPasskeyAccount(opts: {
+  ownerX: bigint; ownerY: bigint; address: Address; credentialId: string; onStatus?: (s: string) => void;
+}) {
+  const { ownerX, ownerY, address, credentialId } = opts;
+
+  async function signHash(hash: Hex): Promise<Hex> {
+    opts.onStatus?.('Signing with passkey (check the browser prompt)...');
+    const cred = (await navigator.credentials.get({
+      publicKey: {
+        challenge: hexToBytes(hash),
+        rpId: window.location.hostname === 'localhost' ? 'localhost' : undefined,
+        userVerification: 'required', // CRITICAL: Must be 'required' for UV flag
+        allowCredentials: [{ type: 'public-key', id: b64uToBytes(credentialId) }],
+      },
+    })) as PublicKeyCredential;
+    
+    const resp = cred.response as AuthenticatorAssertionResponse;
+    let { r, s } = parseASN1Signature(new Uint8Array(resp.signature));
+    if (s > P256_N / 2n) s = P256_N - s; // Low-s normalization
+
+    return encodePasskeySignature(
+      bytesToHex(new Uint8Array(resp.authenticatorData)),
+      new TextDecoder().decode(resp.clientDataJSON),
+      r, s, ownerX
+    );
+  }
+
+  return toSmartAccount({
+    client: publicClient,
+    entryPoint: { abi: entryPoint07Abi, address: entryPoint07Address, version: '0.7' },
+    async getAddress() { return address; },
+    async getFactoryArgs() {
+      const code = await publicClient.getCode({ address });
+      if (code && code !== '0x') return { factory: undefined, factoryData: undefined };
+      return {
+        factory: FACTORY_ADDRESS,
+        factoryData: encodeFunctionData({
+          abi: factoryAbi, functionName: 'createAccount',
+          args: [[ownerX], [ownerY], GUARDIAN_ADDRESS, 0n],
+        }),
+      };
+    },
+    async encodeCalls(calls: any[]) {
+      if (calls.length !== 1) throw new Error('Batching not supported yet');
+      const c = calls[0];
+      return encodeFunctionData({
+        abi: executeAbi, functionName: 'execute',
+        args: [c.to, c.value ?? 0n, c.data ?? '0x'],
+      });
+    },
+    async decodeCalls(data: Hex) {
+      const { args } = await publicClient.simulateContract({ // Simplified for typing
+        address, abi: [{name:'decodeCalls',type:'function',inputs:[{name:'data',type:'bytes'}],outputs:[{type:'address'},{type:'uint256'},{type:'bytes'}]}], functionName: 'decodeCalls', args: [data]
+      } as any);
+      return [{ to: args[0] as Address, value: args[1] as bigint, data: args[2] as Hex }];
+    },
+    async getStubSignature() {
+      const clientData = '{"type":"webauthn.get","challenge":"' + 'A'.repeat(43) + '","origin":"http://localhost:5173","crossOrigin":false}';
+      const authData = ('0x' + '00'.repeat(32) + '05' + '00000001') as Hex; 
+      return encodePasskeySignature(authData, clientData, 1n << 200n, 1n << 200n, ownerX);
+    },
+    async signMessage() { throw new Error('signMessage not supported'); },
+    async signTypedData() { throw new Error('signTypedData not supported'); },
+    async signUserOperation(parameters: any) {
+      const { chainId = baseSepolia.id, ...userOperation } = parameters;
+      const hash = getUserOperationHash({
+        chainId,
+        entryPointAddress: entryPoint07Address,
+        entryPointVersion: '0.7',
+        userOperation: { ...userOperation, sender: address },
+      });
+      return signHash(hash);
+    },
+  });
+}
+
+export default function App() {
+  // Remove Device State
+  const [devices, setDevices] = useState<any[]>([]);
+  const [registeredDevices, setRegisteredDevices] = useState<string>('');
+  const [removeDeviceX, setRemoveDeviceX] = useState<string>('');
+  const [removeStatus, setRemoveStatus] = useState<string>('');
+  const [isRemoving, setIsRemoving] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<Address>('');
+  const [balance, setBalance] = useState<string>('0');
+  const [status, setStatus] = useState<string>('Ready.');
+  const [txHash, setTxHash] = useState<string>('');
+  
+  // Send State
+  const [recipient, setRecipient] = useState('');
+  const [amount, setAmount] = useState('');
+  const [isSending, setIsSending] = useState(false);
+
+  // Recovery State
+  const [newDeviceX, setNewDeviceX] = useState<bigint>(0n);
+  const [newDeviceY, setNewDeviceY] = useState<bigint>(0n);
+  const [recoveryStatus, setRecoveryStatus] = useState<string>('');
+  const [recoveryCredId, setRecoveryCredId] = useState<string>('');
+  const [recoveryX, setRecoveryX] = useState<bigint>(0n);
+  const [recoveryY, setRecoveryY] = useState<bigint>(0n);
+  const [isRecovering, setIsRecovering] = useState(false);
+  const [recoveryRecipient, setRecoveryRecipient] = useState<string>('');
+  const [recoveryAmount, setRecoveryAmount] = useState<string>('');
+  const [isSendingRecovery, setIsSendingRecovery] = useState(false);
+  const [recoverySendStatus, setRecoverySendStatus] = useState<string>('');
+  const [recoveryTxHash, setRecoveryTxHash] = useState<string>('');
+
+  // Load existing wallet
+  useEffect(() => {
+    const saved = localStorage.getItem('passkeyWallet');
+    if (saved) {
+      try {
+        const { address } = JSON.parse(saved);
+        setWalletAddress(address);
+        fetchBalance(address);
+      } catch (e) { console.error("Failed to parse saved passkey", e); }
+    }
+    
+    const recoverySaved = localStorage.getItem('recoveryDevice');
+    if (recoverySaved) {
+      try {
+        const { credId, x, y } = JSON.parse(recoverySaved);
+        setRecoveryCredId(credId);
+        setRecoveryX(BigInt(x));
+        setRecoveryY(BigInt(y));
+      } catch (e) { console.error("Failed to parse recovery device", e); }
+    }
+    const devicesData = JSON.parse(localStorage.getItem('devices') || '[]');
+    setDevices(devicesData);
+  }, []);
+
+  const fetchBalance = async (addr: Address) => {
+    try {
+      const bal = await publicClient.getBalance({ address: addr });
+      setBalance(formatEther(bal));
+    } catch (e) { console.error(e); }
+  };
+
+  // --- Action 1: Register Primary Passkey ---
+  const registerPasskey = async () => {
+    setStatus('🔐 Creating Passkey. Please use Windows Hello or scan with your phone.');
+    try {
+      const credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rp: { name: 'Passkey Wallet', id: window.location.hostname === 'localhost' ? 'localhost' : undefined },
+          user: { id: crypto.getRandomValues(new Uint8Array(32)), name: 'user@wallet.com', displayName: 'Wallet User' },
+          pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+          authenticatorSelection: { userVerification: 'required' }
+        }
+      }) as PublicKeyCredential;
+
+      const response = credential.response as AuthenticatorAttestationResponse;
+      const publicKey = response.getPublicKey();
+      if (!publicKey) throw new Error('No public key returned');
+
+      const point = pointFromSpki(btoa(String.fromCharCode(...new Uint8Array(publicKey))));
+      const futureAddress = await publicClient.readContract({
+        address: FACTORY_ADDRESS, abi: factoryAbi, functionName: 'getAddress',
+        args: [[point.x], [point.y], GUARDIAN_ADDRESS, 0n]
+      }) as Address;
+
+      const deviceData = {
+        x: point.x.toString(), 
+        y: point.y.toString(), 
+        address: futureAddress, 
+        credId: credential.id,
+        label: 'Primary Device',
+        addedAt: new Date().toISOString()
+      };
+
+      localStorage.setItem('passkeyWallet', JSON.stringify(deviceData));
+
+      // Also add to devices array
+      const devices = JSON.parse(localStorage.getItem('devices') || '[]');
+      devices.push(deviceData);
+      localStorage.setItem('devices', JSON.stringify(devices));
+      
+      setWalletAddress(futureAddress);
+      setStatus('✅ Passkey registered successfully.');
+      fetchBalance(futureAddress);
+    } catch (error: any) {
+      console.error(error);
+      setStatus(`❌ Error: ${error.message}`);
+    }
+  };
+
+  // --- Action 2: Send Gasless Transaction ---
+  const sendGasless = async () => {
+    if (!recipient || !amount) { setStatus('❌ Please enter recipient and amount'); return; }
+    
+    const saved = JSON.parse(localStorage.getItem('passkeyWallet') || '{}');
+    if (!saved.credId) { setStatus('❌ Passkey data missing. Please register again.'); return; }
+    
+    setIsSending(true);
+    setStatus('🔐 Please approve with your Fingerprint / PIN...');
+    setTxHash('');
+
+    try {
+      const account = await toPasskeyAccount({
+        ownerX: BigInt(saved.x), ownerY: BigInt(saved.y), 
+        address: walletAddress, credentialId: saved.credId, onStatus: setStatus,
+      });
+
+      const smartAccountClient = createSmartAccountClient({
+        account, chain: baseSepolia, bundlerTransport: http(pimlicoUrl), paymaster: pimlicoClient,
+        userOperation: { estimateFeesPerGas: async () => (await pimlicoClient.getUserOperationGasPrice()).fast },
+      });
+
+      setStatus('🚀 Building and sending gasless UserOperation...');
+      const hash = await smartAccountClient.sendTransaction({
+        to: recipient as Address, value: parseEther(amount), data: '0x',
+      });
+
+      setTxHash(hash);
+      setStatus('✅ SUCCESS: Gasless transaction sent. Pimlico paid the gas.');
+      await publicClient.waitForTransactionReceipt({ hash });
+      fetchBalance(walletAddress);
+    } catch (error: any) {
+      console.error('Full error:', error);
+      setStatus(`❌ Error: ${error.shortMessage || error.message}`);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  // --- Action 3: Register New Device for Recovery ---
+  const registerRecoveryDevice = async () => {
+    setRecoveryStatus('🔐 Registering new device for recovery...');
+    try {
+      const credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rp: { name: 'Passkey Wallet Recovery', id: window.location.hostname === 'localhost' ? 'localhost' : undefined },
+          user: { id: crypto.getRandomValues(new Uint8Array(32)), name: 'recovery@wallet.com', displayName: 'Recovery Device' },
+          pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+          authenticatorSelection: { userVerification: 'required' }
+        }
+      }) as PublicKeyCredential;
+
+      const response = credential.response as AuthenticatorAttestationResponse;
+      const publicKey = response.getPublicKey();
+      if (!publicKey) throw new Error('No public key returned');
+
+      const point = pointFromSpki(btoa(String.fromCharCode(...new Uint8Array(publicKey))));
+      setNewDeviceX(point.x);
+      setNewDeviceY(point.y);
+      setRecoveryCredId(credential.id);
+      setRecoveryX(point.x);
+      setRecoveryY(point.y);
+      const recoveryDeviceData = {
+        x: point.x.toString(),
+        y: point.y.toString(),
+        credId: credential.id,
+        label: 'Recovery Device',
+        addedAt: new Date().toISOString()
+      };
+
+      localStorage.setItem('recoveryDevice', JSON.stringify(recoveryDeviceData));
+
+      // Also add to devices array
+      const devices = JSON.parse(localStorage.getItem('devices') || '[]');
+      devices.push(recoveryDeviceData);
+      localStorage.setItem('devices', JSON.stringify(devices));
+
+      setRecoveryCredId(credential.id);
+      setRecoveryX(point.x);
+      setRecoveryY(point.y);
+      setRecoveryStatus(`✅ Device registered. X: ${point.x.toString().slice(0, 10)}... Waiting for Guardian approval.`);
+    } catch (error: any) {
+      console.error(error);
+      setRecoveryStatus(`❌ Error: ${error.message}`);
+    }
+  };
+
+  // --- Action 4: Authorize New Device via Guardian ---
+  const authorizeRecoveryDevice = async () => {
+    if (newDeviceX === 0n) { setRecoveryStatus('❌ Please register a new device first.'); return; }
+    setIsRecovering(true);
+    setRecoveryStatus('🔄 Asking Guardian MetaMask to authorize the new device...');
+
+    try {
+      const accounts = await (window as any).ethereum.request({ method: 'eth_requestAccounts' });
+      const senderAddress = accounts[0];
+      if (senderAddress.toLowerCase() !== GUARDIAN_ADDRESS.toLowerCase()) {
+        throw new Error('Please connect the Guardian MetaMask wallet');
+      }
+
+      const data = encodeFunctionData({
+        abi: recoveryAbi, functionName: 'addPasskey', args: [newDeviceX, newDeviceY]
+      });
+
+      const hash = await (window as any).ethereum.request({
+        method: 'eth_sendTransaction',
+        params: [{ from: senderAddress, to: walletAddress, data: data, value: '0x0' }],
+      });
+
+      setRecoveryStatus('✅ Transaction sent. Waiting for confirmation...');
+      await publicClient.waitForTransactionReceipt({ hash });
+      setRecoveryStatus('✅ New device successfully authorized by Guardian!');
+      setNewDeviceX(0n);
+      setNewDeviceY(0n);
+    } catch (error: any) {
+      console.error(error);
+      setRecoveryStatus(`❌ Error: ${error.message}`);
+    } finally {
+      setIsRecovering(false);
+    }
+  };
+
+// --- View Registered Devices ---
+const viewRegisteredDevices = async () => {
+  setRegisteredDevices('Loading...');
+  try {
+    // Read the passkeys mapping from the contract
+    // We'll query a few known X coordinates to see which ones are registered
+    const passkeysAbi = [{
+      name: 'passkeys', type: 'function',
+      inputs: [{name: '', type: 'uint256'}],
+      outputs: [{name: '', type: 'uint256'}],
+      stateMutability: 'view'
+    }] as const;
+
+    // Get the current wallet's primary passkey X from localStorage
+    const saved = JSON.parse(localStorage.getItem('passkeyWallet') || '{}');
+    if (!saved.x) {
+      setRegisteredDevices('No passkey data found in localStorage');
+      return;
+    }
+
+    const primaryX = BigInt(saved.x);
+    const primaryY = await publicClient.readContract({
+      address: walletAddress,
+      abi: passkeysAbi,
+      functionName: 'passkeys',
+      args: [primaryX]
+    });
+
+    let result = `Device 1 (Primary):\nX: ${primaryX.toString()}\nY: ${primaryY.toString()}\n\n`;
+
+    // Try to find other registered devices by checking recent addPasskey transactions
+    // For now, just show the primary one
+    result += 'To find other devices, check the transaction history on BaseScan and look for addPasskey calls.';
+
+    setRegisteredDevices(result);
+  } catch (error: any) {
+    console.error(error);
+    setRegisteredDevices(`Error: ${error.message}`);
+  }
+};
+  
+  // --- Action 5: Remove Device via Guardian ---
+const removeDevice = async () => {
+  if (!removeDeviceX) { setRemoveStatus('❌ Please enter the X coordinate of the device to remove.'); return; }
+  setIsRemoving(true);
+  setRemoveStatus('🔄 Asking Guardian MetaMask to remove the device...');
+
+  try {
+    const accounts = await (window as any).ethereum.request({ method: 'eth_requestAccounts' });
+    const senderAddress = accounts[0];
+    if (senderAddress.toLowerCase() !== GUARDIAN_ADDRESS.toLowerCase()) {
+      throw new Error('Please connect the Guardian MetaMask wallet');
+    }
+
+    const removeAbi = [{
+      name: 'removePasskey', type: 'function',
+      inputs: [{name: '_ownerX', type: 'uint256'}],
+      outputs: [], stateMutability: 'nonpayable'
+    }] as const;
+
+    const data = encodeFunctionData({
+      abi: removeAbi, functionName: 'removePasskey', args: [BigInt(removeDeviceX)]
+    });
+
+    const hash = await (window as any).ethereum.request({
+      method: 'eth_sendTransaction',
+      params: [{ from: senderAddress, to: walletAddress, data: data, value: '0x0' }],
+    });
+
+    setRemoveStatus('✅ Transaction sent. Waiting for confirmation...');
+    await publicClient.waitForTransactionReceipt({ hash });
+    setRemoveStatus('✅ Device successfully removed!');
+    setRemoveDeviceX('');
+  } catch (error: any) {
+    console.error(error);
+    setRemoveStatus(`❌ Error: ${error.message}`);
+  } finally {
+    setIsRemoving(false);
+  }
+  // Remove from devices array
+  const devices = JSON.parse(localStorage.getItem('devices') || '[]');
+  const updatedDevices = devices.filter((d: any) => d.x !== removeDeviceX);
+  localStorage.setItem('devices', JSON.stringify(updatedDevices));
+  setDevices(updatedDevices);
+};
+
+  // --- Send with Recovery Device ---
+const sendWithRecoveryDevice = async () => {
+  if (!recoveryRecipient || !recoveryAmount) { setRecoverySendStatus('❌ Please enter recipient and amount'); return; }
+  if (!recoveryCredId || recoveryX === 0n) { setRecoverySendStatus('❌ Recovery device not registered'); return; }
+  
+  setIsSendingRecovery(true);
+  setRecoverySendStatus('🔐 Please approve with your recovery device...');
+  setRecoveryTxHash('');
+
+  try {
+    const account = await toPasskeyAccount({
+      ownerX: recoveryX, ownerY: recoveryY, 
+      address: walletAddress, credentialId: recoveryCredId, 
+      onStatus: setRecoverySendStatus,
+    });
+
+    const smartAccountClient = createSmartAccountClient({
+      account, chain: baseSepolia, bundlerTransport: http(pimlicoUrl), paymaster: pimlicoClient,
+      userOperation: { estimateFeesPerGas: async () => (await pimlicoClient.getUserOperationGasPrice()).fast },
+    });
+
+    setRecoverySendStatus('🚀 Building and sending gasless UserOperation...');
+    const hash = await smartAccountClient.sendTransaction({
+      to: recoveryRecipient as Address, value: parseEther(recoveryAmount), data: '0x',
+    });
+
+    setRecoveryTxHash(hash);
+    setRecoverySendStatus('✅ SUCCESS: Recovery device signed the transaction!');
+    await publicClient.waitForTransactionReceipt({ hash });
+    fetchBalance(walletAddress);
+  } catch (error: any) {
+    console.error('Full error:', error);
+    setRecoverySendStatus(`❌ Error: ${error.shortMessage || error.message}`);
+  } finally {
+    setIsSendingRecovery(false);
+  }
+};
+
+  // --- UI Styles ---
+  const cardStyle = { background: '#ffffff', padding: '1.5rem', borderRadius: '12px', border: '1px solid #e5e7eb', marginBottom: '1.5rem', boxShadow: '0 1px 3px rgba(0,0,0,0.05)' };
+  const inputStyle = { width: '100%', padding: '0.75rem', borderRadius: '8px', border: '1px solid #d1d5db', marginTop: '0.5rem', boxSizing: 'border-box' as const, fontSize: '14px' };
+  const buttonStyle = (loading?: boolean, variant: 'primary' | 'secondary' | 'danger' = 'primary') => {
+    const colors = { primary: '#0052ff', secondary: '#6b7280', danger: '#dc2626' };
+    return {
+      padding: '0.75rem 1.5rem', fontSize: '14px', fontWeight: 600, cursor: loading ? 'not-allowed' : 'pointer',
+      backgroundColor: loading ? '#d1d5db' : colors[variant], color: 'white', border: 'none', borderRadius: '8px', marginTop: '1rem', width: '100%'
+    };
+  };
+
+  return (
+    <div style={{ padding: '2rem', fontFamily: 'system-ui, -apple-system, sans-serif', maxWidth: '800px', margin: '0 auto', color: '#111827' }}>
+      <h1 style={{ marginBottom: '0.5rem', fontSize: '24px', fontWeight: 700 }}>Passkey Smart Wallet</h1>
+      <p style={{ color: '#6b7280', marginTop: '0', marginBottom: '2rem' }}>ERC-4337 Account Abstraction with P-256 Hardware Verification</p>
+
+      {!walletAddress ? (
+        <div style={{ ...cardStyle, textAlign: 'center', padding: '3rem' }}>
+          <h3 style={{ marginTop: 0 }}>Welcome</h3>
+          <p style={{ color: '#6b7280', marginBottom: '1.5rem' }}>Create your gasless, recoverable smart wallet using your device's biometrics.</p>
+          <button onClick={registerPasskey} style={buttonStyle(false, 'primary')}>Register Passkey</button>
+          {status && <p style={{ marginTop: '1rem', fontWeight: 600, color: status.includes('✅') ? '#059669' : status.includes('❌') ? '#dc2626' : '#0052ff' }}>{status}</p>}
+        </div>
+      ) : (
+        <>
+          {/* Section 1: Wallet Overview */}
+          <div style={cardStyle}>
+            <h3 style={{ marginTop: 0, marginBottom: '1rem', fontSize: '18px' }}>Wallet Overview</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <div>
+                <p style={{ margin: 0, fontSize: '14px', color: '#6b7280' }}>Balance</p>
+                <p style={{ margin: '0.25rem 0 0 0', fontSize: '32px', fontWeight: 700, color: '#059669' }}>{parseFloat(balance).toFixed(6)} ETH</p>
+              </div>
+              <button onClick={() => { localStorage.removeItem('passkeyWallet'); window.location.reload(); }} style={{ ...buttonStyle(false, 'danger'), width: 'auto', marginTop: 0, padding: '0.5rem 1rem', fontSize: '12px' }}>
+                Reset Wallet
+              </button>
+            </div>
+            <div style={{ background: '#f9fafb', padding: '0.75rem', borderRadius: '8px', fontSize: '13px', wordBreak: 'break-all', fontFamily: 'monospace' }}>
+              <span style={{ color: '#6b7280' }}>Address: </span>{walletAddress}
+            </div>
+            <p style={{ marginTop: '1rem', fontSize: '13px', color: '#059669', fontWeight: 600 }}>✅ Primary Passkey Active</p>
+          </div>
+
+          {/* Section 2: Gasless Transactions */}
+          <div style={cardStyle}>
+            <h3 style={{ marginTop: 0, marginBottom: '1rem', fontSize: '18px' }}>Send Funds (Gasless)</h3>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 500 }}>Recipient Address
+              <input type="text" value={recipient} onChange={(e) => setRecipient(e.target.value)} placeholder="0x..." style={inputStyle} />
+            </label>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 500, marginTop: '1rem' }}>Amount (ETH)
+              <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.001" step="0.0001" style={inputStyle} />
+            </label>
+            <button onClick={sendGasless} disabled={isSending} style={buttonStyle(isSending, 'primary')}>
+              {isSending ? 'Processing...' : 'Send via Passkey (Gasless)'}
+            </button>
+            {status && !isSending && <p style={{ marginTop: '1rem', fontWeight: 600, color: status.includes('✅') ? '#059669' : status.includes('❌') ? '#dc2626' : '#0052ff' }}>{status}</p>}
+            {txHash && (
+              <div style={{ marginTop: '1rem', padding: '1rem', background: '#f0fdf4', borderRadius: '8px', border: '1px solid #bbf7d0' }}>
+                <p style={{ margin: '0 0 0.5rem 0', fontWeight: 600, color: '#059669' }}>Transaction Confirmed</p>
+                <a href={`https://sepolia.basescan.org/tx/${txHash}`} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all', color: '#0052ff', fontSize: '13px' }}>{txHash}</a>
+              </div>
+            )}
+          </div>
+          {/* Section 3: Guardian Recovery */}
+          <div style={cardStyle}>
+            <h3 style={{ marginTop: 0, marginBottom: '1rem', fontSize: '18px' }}>Guardian Recovery</h3>
+            <p style={{ fontSize: '14px', color: '#6b7280', marginTop: 0 }}>Manage authorized devices. Your Guardian can add or remove passkeys.</p>
+            
+            {/* Registered Devices */}
+            {devices.length > 0 && (
+              <div style={{ marginTop: '1.5rem', padding: '1rem', background: '#f9fafb', borderRadius: '8px' }}>
+                <h4 style={{ fontSize: '14px', fontWeight: 600, marginBottom: '0.75rem' }}>Registered Devices ({devices.length})</h4>
+                {devices.map((device, index) => (
+                  <div key={index} style={{ 
+                    padding: '0.75rem', 
+                    background: 'white', 
+                    borderRadius: '6px', 
+                    marginBottom: '0.5rem',
+                    border: '1px solid #e5e7eb',
+                    fontSize: '13px'
+                  }}>
+                    <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{device.label}</div>
+                    <div style={{ color: '#6b7280', fontSize: '12px', wordBreak: 'break-all' }}>
+                      X: {device.x.substring(0, 20)}...
+                    </div>
+                    <div style={{ color: '#9ca3af', fontSize: '11px', marginTop: '0.25rem' }}>
+                      Added: {new Date(device.addedAt).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Add Device */}
+            <div style={{ marginBottom: '2rem' }}>
+              <h4 style={{ fontSize: '15px', fontWeight: 600, marginBottom: '0.75rem' }}>Add New Device</h4>
+              {newDeviceX === 0n ? (
+                <button onClick={registerRecoveryDevice} style={buttonStyle(false, 'secondary')}>Register New Device</button>
+              ) : (
+                <button onClick={authorizeRecoveryDevice} disabled={isRecovering} style={buttonStyle(isRecovering, 'primary')}>
+                  Authorize with Guardian MetaMask
+                </button>
+              )}
+              {recoveryStatus && <p style={{ marginTop: '1rem', fontWeight: 600, color: recoveryStatus.includes('✅') ? '#059669' : recoveryStatus.includes('❌') ? '#dc2626' : '#0052ff' }}>{recoveryStatus}</p>}
+            </div>
+
+            {/* Remove Device */}
+            <div style={{ borderTop: '1px solid #e5e7eb', paddingTop: '1.5rem' }}>
+              <h4 style={{ fontSize: '15px', fontWeight: 600, marginBottom: '0.75rem' }}>Remove Device</h4>
+              <p style={{ fontSize: '13px', color: '#6b7280', marginBottom: '1rem' }}>Enter the X coordinate of the passkey to remove. You can find this in your browser's developer console when registering.</p>
+              <input 
+                type="text" 
+                value={removeDeviceX} 
+                onChange={(e) => setRemoveDeviceX(e.target.value)} 
+                placeholder="X coordinate (e.g., 36740537836080506874358551555591289808178200592608060324577213821335482406655)"
+                style={inputStyle}
+              />
+              <button onClick={removeDevice} disabled={isRemoving} style={buttonStyle(isRemoving, 'danger')}>
+                {isRemoving ? 'Removing...' : 'Remove Device via Guardian'}
+              </button>
+              {removeStatus && <p style={{ marginTop: '1rem', fontWeight: 600, color: removeStatus.includes('✅') ? '#059669' : removeStatus.includes('❌') ? '#dc2626' : '#0052ff' }}>{removeStatus}</p>}
+            </div>
+
+            {/* Sign with Recovery Device */}
+            {recoveryCredId && (
+              <div style={{ borderTop: '1px solid #e5e7eb', paddingTop: '1.5rem', marginTop: '1.5rem' }}>
+                <h4 style={{ fontSize: '15px', fontWeight: 600, marginBottom: '0.75rem' }}>Test Recovery Device</h4>
+                <p style={{ fontSize: '13px', color: '#6b7280', marginBottom: '1rem' }}>
+                  Send a small amount to prove the 2nd device can sign transactions.
+                </p>
+                <input 
+                  type="text" 
+                  value={recoveryRecipient} 
+                  onChange={(e) => setRecoveryRecipient(e.target.value)} 
+                  placeholder="Recipient address (e.g., your Guardian)"
+                  style={inputStyle}
+                />
+                <input 
+                  type="number" 
+                  value={recoveryAmount} 
+                  onChange={(e) => setRecoveryAmount(e.target.value)} 
+                  placeholder="Amount (ETH)"
+                  step="0.0001"
+                  style={{...inputStyle, marginTop: '0.5rem'}}
+                />
+                <button onClick={sendWithRecoveryDevice} disabled={isSendingRecovery} style={buttonStyle(isSendingRecovery, 'primary')}>
+                  {isSendingRecovery ? 'Processing...' : 'Send via Recovery Device (Gasless)'}
+                </button>
+                {recoverySendStatus && <p style={{ marginTop: '1rem', fontWeight: 600, color: recoverySendStatus.includes('✅') ? '#059669' : recoverySendStatus.includes('❌') ? '#dc2626' : '#0052ff' }}>{recoverySendStatus}</p>}
+                {recoveryTxHash && (
+                  <div style={{ marginTop: '1rem', padding: '1rem', background: '#f0fdf4', borderRadius: '8px', border: '1px solid #bbf7d0' }}>
+                    <p style={{ margin: '0 0 0.5rem 0', fontWeight: 600, color: '#059669' }}>Transaction Confirmed</p>
+                    <a href={`https://sepolia.basescan.org/tx/${recoveryTxHash}`} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all', color: '#0052ff', fontSize: '13px' }}>{recoveryTxHash}</a>
+                  </div>
+                )}
+              </div>
+            )}
+          </div> 
+        </>
+      )}
+    </div>
+  );
+}
